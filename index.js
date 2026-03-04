@@ -13,7 +13,8 @@ const io = new Server(server, {
     methods: ["GET", "POST"]
   },
   pingTimeout: 60000,
-  pingInterval: 25000
+  pingInterval: 25000,
+  transports: ['websocket', 'polling']
 });
 
 // Waiting queues for each mode
@@ -27,12 +28,11 @@ const waitingUsers = {
 const pairs = new Map();
 const userInfo = new Map();
 
-// Health check endpoint
+// Health check
 app.get('/', (req, res) => {
-  const online = io.engine.clientsCount;
   res.json({ 
     status: 'RandomChat Server Running! 🚀',
-    online: online,
+    online: io.engine.clientsCount,
     waiting: {
       chat: waitingUsers.chat.length,
       audio: waitingUsers.audio.length,
@@ -42,7 +42,6 @@ app.get('/', (req, res) => {
   });
 });
 
-// Ping endpoint for keep-alive
 app.get('/ping', (req, res) => {
   res.send('pong');
 });
@@ -50,72 +49,77 @@ app.get('/ping', (req, res) => {
 io.on('connection', (socket) => {
   console.log('✅ User connected:', socket.id);
   
-  // Send online count to all immediately
-  const onlineCount = io.engine.clientsCount;
-  io.emit('onlineCount', onlineCount);
-  console.log('📊 Online users:', onlineCount);
+  // Send online count immediately
+  io.emit('onlineCount', io.engine.clientsCount);
 
-  // User wants to find partner
+  // Find partner
   socket.on('findPartner', (data) => {
     const { mode, profile } = data;
-    console.log('🔍 Finding partner for:', socket.id, 'Mode:', mode);
+    console.log('🔍 Finding partner for:', socket.id, 'Mode:', mode, 'Profile:', profile?.name);
     
     // Store user info
     userInfo.set(socket.id, { mode, profile });
     
-    // Remove from any existing queue
-    Object.keys(waitingUsers).forEach(m => {
-      waitingUsers[m] = waitingUsers[m].filter(id => id !== socket.id);
+    // Remove from all queues first
+    ['chat', 'audio', 'video'].forEach(m => {
+      const index = waitingUsers[m].indexOf(socket.id);
+      if (index > -1) {
+        waitingUsers[m].splice(index, 1);
+      }
     });
     
-    // Check if someone is waiting
+    // Check if someone is waiting in this mode
+    console.log('📊 Queue before:', mode, waitingUsers[mode]);
+    
     if (waitingUsers[mode].length > 0) {
       const partnerId = waitingUsers[mode].shift();
-      const partnerInfo = userInfo.get(partnerId);
-      
-      // Verify partner is still connected
       const partnerSocket = io.sockets.sockets.get(partnerId);
-      if (!partnerSocket) {
-        // Partner disconnected, add current user to queue
+      
+      // Check if partner is still connected
+      if (!partnerSocket || !partnerSocket.connected) {
+        console.log('⚠️ Partner disconnected, adding to queue:', socket.id);
         waitingUsers[mode].push(socket.id);
         socket.emit('waiting');
-        console.log('⏳ Partner was disconnected, waiting:', socket.id);
         return;
       }
+      
+      const partnerInfo = userInfo.get(partnerId);
       
       // Create pair
       pairs.set(socket.id, partnerId);
       pairs.set(partnerId, socket.id);
       
-      // Notify both users
+      console.log('🎉 MATCHED:', socket.id, '<->', partnerId);
+      
+      // Notify current user
       socket.emit('matched', { 
         partnerId: partnerId,
         partnerProfile: partnerInfo?.profile || { name: 'Stranger', avatar: '👤' }
       });
       
-      io.to(partnerId).emit('matched', { 
+      // Notify partner
+      partnerSocket.emit('matched', { 
         partnerId: socket.id,
         partnerProfile: profile || { name: 'Stranger', avatar: '👤' }
       });
       
-      console.log('🎉 Matched:', socket.id, '<->', partnerId);
     } else {
-      // Add to waiting queue
+      // No one waiting, add to queue
       waitingUsers[mode].push(socket.id);
       socket.emit('waiting');
-      console.log('⏳ Waiting:', socket.id, 'Queue size:', waitingUsers[mode].length);
+      console.log('⏳ Added to queue:', socket.id, 'Queue size:', waitingUsers[mode].length);
     }
   });
 
   // Handle messages
   socket.on('message', (data) => {
     const partnerId = pairs.get(socket.id);
+    console.log('💬 Message from', socket.id, 'to', partnerId, ':', data.text);
     if (partnerId) {
       io.to(partnerId).emit('message', {
         text: data.text,
         from: 'stranger'
       });
-      console.log('💬 Message from', socket.id, 'to', partnerId);
     }
   });
 
@@ -127,29 +131,23 @@ io.on('connection', (socket) => {
     }
   });
 
-  // WebRTC Signaling
+  // WebRTC signaling
   socket.on('offer', (data) => {
     const partnerId = pairs.get(socket.id);
-    if (partnerId) {
-      io.to(partnerId).emit('offer', data);
-    }
+    if (partnerId) io.to(partnerId).emit('offer', data);
   });
 
   socket.on('answer', (data) => {
     const partnerId = pairs.get(socket.id);
-    if (partnerId) {
-      io.to(partnerId).emit('answer', data);
-    }
+    if (partnerId) io.to(partnerId).emit('answer', data);
   });
 
   socket.on('ice-candidate', (data) => {
     const partnerId = pairs.get(socket.id);
-    if (partnerId) {
-      io.to(partnerId).emit('ice-candidate', data);
-    }
+    if (partnerId) io.to(partnerId).emit('ice-candidate', data);
   });
 
-  // Find next partner
+  // Next partner
   socket.on('next', () => {
     console.log('⏭️ Next requested by:', socket.id);
     const partnerId = pairs.get(socket.id);
@@ -160,48 +158,40 @@ io.on('connection', (socket) => {
     pairs.delete(socket.id);
   });
 
-  // User stops
+  // Stop chat
   socket.on('stop', () => {
-    console.log('🛑 Stop requested by:', socket.id);
-    handleDisconnect(socket);
+    console.log('🛑 Stop by:', socket.id);
+    cleanup(socket.id);
   });
 
   // Disconnect
   socket.on('disconnect', () => {
-    handleDisconnect(socket);
+    console.log('❌ Disconnected:', socket.id);
+    cleanup(socket.id);
     io.emit('onlineCount', io.engine.clientsCount);
-    console.log('📊 Online users after disconnect:', io.engine.clientsCount);
   });
 
-  function handleDisconnect(socket) {
-    // Remove from waiting queues
-    Object.keys(waitingUsers).forEach(mode => {
-      waitingUsers[mode] = waitingUsers[mode].filter(id => id !== socket.id);
+  function cleanup(socketId) {
+    // Remove from all queues
+    ['chat', 'audio', 'video'].forEach(mode => {
+      const index = waitingUsers[mode].indexOf(socketId);
+      if (index > -1) {
+        waitingUsers[mode].splice(index, 1);
+      }
     });
     
     // Notify partner
-    const partnerId = pairs.get(socket.id);
+    const partnerId = pairs.get(socketId);
     if (partnerId) {
       io.to(partnerId).emit('partnerLeft');
       pairs.delete(partnerId);
     }
-    pairs.delete(socket.id);
-    userInfo.delete(socket.id);
-    
-    console.log('❌ User disconnected:', socket.id);
+    pairs.delete(socketId);
+    userInfo.delete(socketId);
   }
 });
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  
-  // ⭐ KEEP ALIVE - Ping itself every 14 minutes to prevent sleep
-  const RENDER_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
-  
-  setInterval(() => {
-    fetch(`${RENDER_URL}/ping`)
-      .then(() => console.log('🏓 Self-ping successful'))
-      .catch(() => console.log('🏓 Self-ping (local)'));
-  }, 14 * 60 * 1000); // Every 14 minutes
 });
